@@ -1,0 +1,12 @@
+# Device rs01: may only publish its own data topics and read its own command topic.
+user rs01
+topic write rs/T24/pose
+topic write rs/T24/pothole
+topic write rs/T24/status
+topic write rs/T24/info
+topic read rs/T24/cmd/rs01
+
+# Dashboard / logger: read everything from the team, send commands.
+user dashboard
+topic read rs/T24/#
+topic write rs/T24/cmd/#

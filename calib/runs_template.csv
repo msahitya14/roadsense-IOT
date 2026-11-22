@@ -1,0 +1,4 @@
+run,end_x_m,end_y_m,end_lat,end_lon,path_len_m,end_hdg_deg,notes
+run01,10.00,0.00,,,10.00,0,straight along the tape
+run02,8.20,5.10,,,12.40,90,left turn at the cone
+run03,,,33.6431020,-117.8414530,,,end point read from Google Maps

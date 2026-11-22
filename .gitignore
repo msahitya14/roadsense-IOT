@@ -1,0 +1,13 @@
+firmware/.pio/
+firmware/include/secrets.h
+broker/passwd
+broker/credentials.txt
+broker/data/
+logs/
+.venv/
+__pycache__/
+.claude/
+.DS_Store
+calib/fit.png
+# progress report PDF has team emails: add it deliberately if you want it public
+*.pdf
