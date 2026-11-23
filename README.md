@@ -33,10 +33,15 @@ The equations, the models we compare, and the calibration procedure are in **[do
 ```
 ├── firmware/              PlatformIO project for the ESP32 → see firmware/README.md
 ├── broker/                local Mosquitto: config, ACL, setup.sh (users), run.sh (start on the LAN)
-├── dashboard/index.html   browser dashboard: Leaflet map, local XY plot, calibration buttons (works offline)
+├── dashboard/             Svelte + Vite dashboard (map, XY, charts, link health, reliability test, controls)
+│   ├── src/                   App.svelte, components/, lib/ (MQTT state, link stats, CSV export)
+│   ├── dist/                  prebuilt copy served by broker/run.sh (no Node needed to use it)
+│   └── legacy/                the original single-file dashboard (fallback)
 ├── tools/
-│   ├── ble_bridge.py          BLE ⇄ MQTT gateway on the Mac (default transport), raw IMU → logs/raw-*.csv
-│   ├── logger.py              record every MQTT message to logs/*.jsonl
+│   ├── ble_bridge.py          BLE ⇄ MQTT gateway on the Mac (default transport); writes system-timestamped CSVs
+│   ├── logger.py              record every MQTT message to logs/*.jsonl (+ the same CSVs; for Wi-Fi mode)
+│   ├── csvlog.py              CSV session logs with rx_unix / rx_iso system time on every row
+│   ├── reliability_report.py  loss, latency, jitter, outages, clock drift from the CSVs (+ plots)
 │   ├── simulate_car.py        fake car for testing the broker and dashboard without hardware
 │   ├── fit_calibration.py     fit speed and gyro models from start → end runs (LOO cross-validation, plot)
 │   ├── analyze_surface.py     suggest surface thresholds from labelled runs
@@ -110,7 +115,21 @@ Keep the car still for the first 2 seconds (gyro calibration). The OLED header s
 
 ### 4. Dashboard and logging
 
-* **Dashboard:** open `dashboard/index.html`. `run.sh` serves it at http://localhost:8000. Enter the broker URL and the `dashboard` login. You can pick the start point on the map, set the start bearing, then drive.
+* **Dashboard:** `run.sh` serves the prebuilt Svelte dashboard at http://localhost:8000. Enter the broker URL (`ws://localhost:9001`) and the `dashboard` login. The login is remembered, and the page reconnects after a reload. Panels:
+  * **Map:** pick the start point and bearing, then drive. The path is coloured by surface. Click the true position to get the error, or to re-anchor the car.
+  * **Local XY plot:** with a "follow car" option.
+  * **Live tiles:** pose, raw integrals, and distance per surface.
+  * **Time series (uPlot):** speed and heading, vibration, x/y, and received frames per second, over a 30 s – 5 min window.
+  * **Link health:** receive rate, loss, skipped/late frames, latency and inter-arrival percentiles, outages, and the car's own counters.
+  * **Reliability test:** start/stop, live summary, CSV export with system timestamps, copy summary.
+  * **Controls:** calibration commands, `txHz`/`parkS`, raw stream toggle, any command, and a parameter table.
+  * **Potholes:** table plus ≥3-within-5 m alerts.
+  * **Event log:** with filters.
+* **Developing the dashboard:**
+  ```bash
+  cd dashboard && npm install && npm run dev
+  ```
+  This gives hot reload on http://localhost:5173. After changes, run `npm run build` to refresh `dist/`.
 * **Logger:**
   ```bash
   .venv/bin/python tools/logger.py
@@ -154,6 +173,36 @@ The script fits these models with Levenberg–Marquardt and ranks them by leave-
 It prints the `set …` commands for the car and saves `calib/fit.png`. All the details are in [docs/CALIBRATION.md](docs/CALIBRATION.md).
 
 ---
+
+## Reliability testing
+
+Every row that the bridge (BLE) or logger (Wi-Fi) writes carries the **Mac's system receive time** (`rx_unix` in epoch seconds, `rx_iso` in local ISO-8601 with ms), next to the car's own clock (`t_ms`):
+
+| File | Rows |
+|---|---|
+| `logs/pose-<stamp>.csv` | every pose |
+| `logs/pothole-<stamp>.csv` | every pothole |
+| `logs/link-<stamp>.csv` | connect/disconnect, car status, command and info events |
+| `logs/raw-<stamp>.csv` | 200 Hz raw IMU (bridge `--raw`) |
+
+Suggested test procedure:
+1. Start `broker/run.sh` and `tools/ble_bridge.py`. In the dashboard, click **Start test**.
+2. Drive normally for 10–30 min. Include parked periods, driving away until the link drops, and coming back.
+3. Click **Stop test**, then **Export test CSV** (the browser's view), or use the bridge CSVs (the authoritative record):
+   ```bash
+   .venv/bin/python tools/reliability_report.py logs/pose-<stamp>.csv --plot
+   ```
+   The report gives:
+   * received rate while driving and parked,
+   * frames **lost in transit** vs **skipped on purpose** by the car's 1 Hz offline buffer (told apart by the car's clock),
+   * duplicates, out-of-order frames and reboots,
+   * inter-arrival p50/p95/p99 and jitter,
+   * one-way **latency above the best case** (drift-corrected, so the clocks don't need to be synchronised),
+   * frames delivered late from the buffer,
+   * car-vs-Mac **clock drift** in ppm,
+   * a list of **outages**, and the car's queued/dropped/reconnect counters.
+
+   `--plot` saves `logs/reliability-<stamp>.png` with the rate over time (outages shaded), latency, and an inter-arrival histogram. Use `--from HH:MM:SS --to HH:MM:SS` to analyse part of a session.
 
 ## MQTT topics and messages
 

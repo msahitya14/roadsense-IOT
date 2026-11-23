@@ -11,4 +11,5 @@ struct ImuSample {
 // Returns WHO_AM_I (0x68 for genuine parts, clones differ) or -1 on I2C failure.
 int imuBegin(int sda, int scl, uint8_t addr, uint32_t hz = 400000);
 String i2cScan();  // "0x68 0x76 " or "none"
+String i2cRecover(int sda, int scl);  // free a bus stuck by a reset mid-transfer; returns line levels
 bool imuRead(ImuSample& s);

@@ -11,11 +11,12 @@ work unchanged. Commands published on rs/T24/cmd/rs01 (dashboard buttons) are wr
 
 First run: macOS asks to allow Bluetooth for Terminal/Python (System Settings > Privacy > Bluetooth).
 """
-import argparse, asyncio, csv, json, struct, sys, time
+import argparse, asyncio, json, struct, sys, time
 
 from bleak import BleakClient, BleakScanner
 
 import mqtt_common as mc
+from csvlog import SessionCSV, stamp_now
 
 SVC_UUID = "6e400001-b5a3-f393-e0a9-e50e24dcca9e"
 RX_UUID = "6e400002-b5a3-f393-e0a9-e50e24dcca9e"  # write: commands to the car
@@ -62,7 +63,7 @@ class Bridge:
         self.client = None
         self.mq = None
         self.jsonl = None
-        self.raw_csv = None
+        self.csv = None
         self.info_buf = b""
         self.last_seq = None
         self.stats = dict(pose=0, pot=0, raw=0, bytes=0, gaps=0, t0=time.time())
@@ -78,6 +79,8 @@ class Bridge:
 
     def offline(self):
         self.out("status", {"dev": self.dev, "state": "offline", "link": "ble"}, retain=True)
+        if self.csv:
+            self.csv.link("disconnected")
 
     def open_logs(self):
         (mc.ROOT / "logs").mkdir(exist_ok=True)
@@ -86,11 +89,13 @@ class Bridge:
             p = mc.ROOT / "logs" / f"ble-{stamp}.jsonl"
             self.jsonl = p.open("a", buffering=1)
             print(f"logging to {p}")
-        self.raw_path = mc.ROOT / "logs" / f"raw-{stamp}.csv"
+        if not self.a.no_csv:  # CSVs with the Mac's system receive time (reliability tests)
+            self.csv = SessionCSV(mc.ROOT / "logs", stamp)
 
     # ---------------------------------------------------------------- BLE frames
     def on_frame(self, _char, data: bytearray):
         b = bytes(data)
+        rx = stamp_now()  # Mac system time this frame arrived
         self.stats["bytes"] += len(b)
         t = b[0] if b else 0
         try:
@@ -99,16 +104,22 @@ class Bridge:
                 self.count_seq(d["seq"])
                 self.stats["pose"] += 1
                 self.out("pose", d, qos=0)
+                if self.csv:
+                    self.csv.pose(d, rx)
             elif t == F_POTHOLE and len(b) == POTHOLE.size:
                 d = decode_pothole(b, self.dev)
                 self.count_seq(d["seq"])
                 self.stats["pot"] += 1
                 print(f"POTHOLE at ({d['x_m']}, {d['y_m']})  z {d['z_neg_g']}/{d['z_pos_g']} g", flush=True)
                 self.out("pothole", d)
+                if self.csv:
+                    self.csv.pothole(d, rx)
             elif t == F_STATUS:
                 d = json.loads(b[1:].decode())
                 d["bridge"] = "mac-ble"
                 self.out("status", d, retain=True)
+                if self.csv:
+                    self.csv.link("status", d, rx)
             elif t == F_INFO and len(b) >= 2:
                 self.info_buf += b[2:]
                 if not b[1]:  # last chunk
@@ -116,16 +127,13 @@ class Bridge:
                     self.info_buf = b""
                     print(f"car: {txt}", flush=True)
                     self.out("info", txt, qos=0)
+                    if self.csv:
+                        self.csv.link("info", txt, rx)
             elif t == F_RAW and len(b) >= RAW_HDR.size:
                 rows = decode_raw(b)
                 self.stats["raw"] += len(rows)
-                if self.raw_csv is None:
-                    fh = self.raw_path.open("w", newline="")
-                    self.raw_csv = csv.writer(fh)
-                    self.raw_csv.writerow(["t_ms", "ax_g", "ay_g", "az_g", "gx_dps", "gy_dps", "gz_dps"])
-                    self.raw_fh = fh
-                    print(f"raw IMU -> {self.raw_path}")
-                self.raw_csv.writerows([(f"{r[0]:.1f}",) + tuple(f"{v:.4f}" for v in r[1:]) for r in rows])
+                if self.csv:
+                    self.csv.raw(rows, rx)
             else:
                 print(f"? unknown frame type {t} len {len(b)}")
         except Exception as e:  # never let one bad frame kill the bridge
@@ -141,6 +149,8 @@ class Bridge:
         if self.client and self.client.is_connected:
             await self.client.write_gatt_char(RX_UUID, cmd.encode(), response=True)
             print(f"> {cmd}", flush=True)
+            if self.csv:
+                self.csv.link("command", cmd)
 
     def on_mqtt_cmd(self, _cl, _u, msg):
         cmd = msg.payload.decode(errors="replace").strip()
@@ -177,6 +187,8 @@ class Bridge:
                 async with BleakClient(dev, disconnected_callback=lambda _c: self.loop.call_soon_threadsafe(gone.set)) as c:
                     self.client = c
                     print(f"connected to {self.a.name} (MTU {c.mtu_size})", flush=True)
+                    if self.csv:
+                        self.csv.link("connected", {"mtu": c.mtu_size})
                     await c.start_notify(TX_UUID, self.on_frame)
                     await self.send_cmd(f"time {int(time.time())}")
                     if self.a.raw:
@@ -200,6 +212,7 @@ def main():
     ap.add_argument("--cmd", action="append", default=[], help="command to send on every connect (repeatable)")
     ap.add_argument("--no-mqtt", action="store_true", help="don't use a broker; implies --log")
     ap.add_argument("--log", action="store_true", help="also write logs/ble-*.jsonl (same format as logger.py)")
+    ap.add_argument("--no-csv", action="store_true", help="don't write logs/pose|pothole|link|raw-*.csv")
     a = ap.parse_args()
     a.log = a.log or a.no_mqtt
     try:

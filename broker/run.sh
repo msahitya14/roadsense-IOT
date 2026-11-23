@@ -75,8 +75,13 @@ mkdir -p data
 "$MOSQ" -c mosquitto.conf &
 PID=$!
 WEB_PID=""
-if ! lsof -nP -iTCP:8000 -sTCP:LISTEN >/dev/null 2>&1; then   # serve the dashboard too
-  python3 -m http.server 8000 --bind 0.0.0.0 --directory "$ROOT/dashboard" >/dev/null 2>&1 &
+# serve the dashboard too: the Svelte build (dashboard/dist), or the no-build legacy page
+DASH_DIR="$ROOT/dashboard/dist"
+[[ -f "$DASH_DIR/index.html" ]] || { DASH_DIR="$ROOT/dashboard/legacy"; yellow "dashboard/dist missing (cd dashboard && npm install && npm run build) - serving the legacy dashboard"; }
+if lsof -nP -iTCP:8000 -sTCP:LISTEN >/dev/null 2>&1; then
+  yellow "Port 8000 is already in use - not starting the dashboard server (stop the other server to use ours)"
+else
+  python3 -m http.server 8000 --bind 0.0.0.0 --directory "$DASH_DIR" >/dev/null 2>&1 &
   WEB_PID=$!
 fi
 trap 'kill $PID $WEB_PID 2>/dev/null; exit 0' INT TERM

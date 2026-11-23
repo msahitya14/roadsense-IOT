@@ -4,6 +4,7 @@
 #include <Arduino.h>
 #include <WiFi.h>
 #include <MQTT.h>
+#include <Wire.h>
 #include "config.h"
 #if __has_include("secrets.h")
 #include "secrets.h"
@@ -386,6 +387,7 @@ void setup() {
   // try both addresses at 400 kHz, then at 100 kHz (long wires / weak pull-ups)
   const uint8_t addrs[2] = {MPU_ADDR, MPU_ADDR == 0x68 ? 0x69 : 0x68};
   int who = -1;
+  Serial.println("I2C bus recovery: " + i2cRecover(I2C_SDA, I2C_SCL));
   for (uint32_t hz : {400000u, 100000u}) {
     for (uint8_t a : addrs) {
       if (who < 0) {
@@ -395,9 +397,16 @@ void setup() {
     }
   }
   while (who < 0) {
+    String lines = i2cRecover(I2C_SDA, I2C_SCL);
+    Wire.begin(I2C_SDA, I2C_SCL);
+    Wire.setClock(100000);
     String found = i2cScan();
     Serial.printf("MPU-6050 NOT FOUND on SDA=%d SCL=%d. I2C scan: %s\n", I2C_SDA, I2C_SCL, found.c_str());
-    if (found == "none")
+    Serial.println("  bus: " + lines);
+    if (lines.indexOf("after SDA=0") >= 0 || lines.indexOf("after SDA=1 SCL=0") >= 0)
+      Serial.println("  -> a line is held LOW: unplug USB for 5 s (power-cycles the MPU); if it stays low, check for a"
+                     " short to GND or an unpowered MPU (VCC loose pulls the lines low)");
+    else if (found == "none")
       Serial.println("  -> no device answers at all: check SDA/SCL not swapped, VCC->3V3, GND, loose jumpers");
     else
       Serial.println("  -> bus works (other parts answer) but no 0x68/0x69: MPU module power/solder/AD0 or a dead module");

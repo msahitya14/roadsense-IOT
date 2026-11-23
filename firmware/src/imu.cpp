@@ -20,6 +20,36 @@ static int readReg(uint8_t reg) {
   return Wire.read();
 }
 
+// The MPU-6050 is not reset when the ESP32 resets (flash, serial monitor, EN button). If that happens
+// mid-read, the MPU can keep holding SDA low and the whole bus looks dead until power is cycled.
+// Standard recovery: clock SCL until the slave releases SDA, then generate a STOP condition.
+String i2cRecover(int sda, int scl) {
+  Wire.end();
+  pinMode(sda, INPUT_PULLUP);
+  pinMode(scl, INPUT_PULLUP);
+  delayMicroseconds(20);
+  int sda0 = digitalRead(sda), scl0 = digitalRead(scl);
+  int pulses = 0;
+  pinMode(scl, OUTPUT_OPEN_DRAIN);
+  digitalWrite(scl, HIGH);
+  while (digitalRead(sda) == LOW && pulses < 16) {
+    digitalWrite(scl, LOW);  delayMicroseconds(10);
+    digitalWrite(scl, HIGH); delayMicroseconds(10);
+    pulses++;
+  }
+  pinMode(sda, OUTPUT_OPEN_DRAIN);  // STOP: SDA low -> high while SCL is high
+  digitalWrite(sda, LOW);  delayMicroseconds(10);
+  digitalWrite(scl, HIGH); delayMicroseconds(10);
+  digitalWrite(sda, HIGH); delayMicroseconds(10);
+  pinMode(sda, INPUT_PULLUP);
+  pinMode(scl, INPUT_PULLUP);
+  delayMicroseconds(20);
+  char b[96];
+  snprintf(b, sizeof(b), "lines before SDA=%d SCL=%d, %d clock pulses, after SDA=%d SCL=%d", sda0, scl0, pulses,
+           digitalRead(sda), digitalRead(scl));
+  return b;
+}
+
 String i2cScan() {
   String found;
   for (uint8_t a = 1; a < 127; a++) {

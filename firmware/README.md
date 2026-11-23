@@ -136,7 +136,8 @@ Commands are accepted from the serial monitor, from the dashboard, or on `rs/T24
 
 | Serial / OLED shows | Cause and fix |
 |---|---|
-| `MPU-6050 NOT FOUND` | Check the wiring and 3V3. Address 0x69 is tried automatically |
+| `MPU-6050 NOT FOUND` | Read the `bus:` line printed under it: `after SDA=0` means a line is held low (unplug USB for 5 s; if that doesn't help, the MPU is unpowered or shorted). `none` with both lines high means bad jumpers or swapped SDA/SCL. Address 0x69 and 100 kHz are tried automatically |
+| Worked before, now not found after flashing | The ESP32 reset mid-read and the MPU kept holding SDA. The boot-time `I2C bus recovery` (16 clock pulses + STOP) normally fixes this; otherwise power-cycle |
 | `OLED init failed` | Check the SPI pins. Everything else keeps working |
 | `BLE: advertising …, waiting for the Mac bridge` | Start `tools/ble_bridge.py`. Allow Bluetooth for Terminal in macOS Privacy settings. Quit other apps connected to the car (nRF Connect, a second bridge) |
 | Bridge connects but no poses arrive | Check the OLED NET page (`connected`, MTU should be 247 or at least 74). Restart the bridge |
