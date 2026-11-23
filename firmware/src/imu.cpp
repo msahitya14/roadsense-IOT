@@ -20,9 +20,23 @@ static int readReg(uint8_t reg) {
   return Wire.read();
 }
 
-int imuBegin(int sda, int scl, uint8_t addr) {
+String i2cScan() {
+  String found;
+  for (uint8_t a = 1; a < 127; a++) {
+    Wire.beginTransmission(a);
+    if (Wire.endTransmission() == 0) {
+      char b[8];
+      snprintf(b, sizeof(b), "0x%02X ", a);
+      found += b;
+    }
+  }
+  return found.length() ? found : String("none");
+}
+
+int imuBegin(int sda, int scl, uint8_t addr, uint32_t hz) {
   s_addr = addr;
-  Wire.begin(sda, scl, 400000);
+  Wire.begin(sda, scl);   // a second call is a no-op, so set the clock separately
+  Wire.setClock(hz);
   int who = readReg(0x75);
   if (who < 0) return -1;
   writeReg(0x6B, 0x80);          // device reset

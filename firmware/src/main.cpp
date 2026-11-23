@@ -19,13 +19,18 @@
 #include "imu.h"
 #include "estimator.h"
 #include "debug_ui.h"
+#include "ble_link.h"
 
 struct CmdLine { char s[96]; };
 struct InfoLine { char s[400]; };
+struct RawItem { uint32_t tMs; RawSample s; };
 
 static Estimator est;
-static QueueHandle_t qPose, qPot, qCmd, qInfo;
+static QueueHandle_t qPose, qPot, qCmd, qInfo, qRaw;
 static volatile uint32_t droppedMsgs = 0, imuErrors = 0;
+static volatile bool g_linkUp = false;      // data path to the laptop is up (BLE subscribed / MQTT connected)
+static volatile float g_txRate = 0;         // pose frames actually sent per second
+static const bool BLE_MODE = NET_MODE == 3;
 
 #ifndef MQTT_TLS
 #define MQTT_TLS 0
@@ -81,6 +86,24 @@ static void getNet(NetState& out) {
 }
 static void updateNet() {
   NetState n{};
+  if (BLE_MODE) {
+    n.mode = 'B';
+    n.wifi = n.mqtt = bleConnected();
+    strlcpy(n.ssid, "RoadSense-" DEVICE_ID, sizeof(n.ssid));
+    snprintf(n.ip, sizeof(n.ip), "mtu %u", (unsigned)(blePayloadMax() + 3));
+    strlcpy(n.broker, "Mac bridge", sizeof(n.broker));
+    n.txRate = g_txRate;
+    n.bleErr = bleNotifyErrors();
+    n.queued = uxQueueMessagesWaiting(qPose);
+    n.dropped = droppedMsgs;
+    n.reconnects = reconnects;
+    n.imuErr = imuErrors;
+    portENTER_CRITICAL(&netMux);
+    netState = n;
+    portEXIT_CRITICAL(&netMux);
+    return;
+  }
+  n.mode = apMode ? 'A' : 'W';
   n.ap = apMode;
   n.wifi = linkUp();
   n.mqtt = n.wifi && mqtt.connected();
@@ -150,10 +173,25 @@ static void sensorTask(void*) {
     if (dt <= 0 || dt > 0.05f) dt = 1.0f / SAMPLE_HZ;
     est.update(s, dt);
 
+    if (BLE_MODE && est.rawLink && g_linkUp) {  // full-rate raw IMU, only while someone listens
+      RawItem r{millis(), {{(int16_t)lroundf(s.ax * 4096), (int16_t)lroundf(s.ay * 4096), (int16_t)lroundf(s.az * 4096),
+                            (int16_t)lroundf(s.gx * 65.5f), (int16_t)lroundf(s.gy * 65.5f), (int16_t)lroundf(s.gz * 65.5f)}}};
+      xQueueSend(qRaw, &r, 0);  // dropped if the link can't keep up
+    }
+
     PoseMsg p;
+    static uint32_t lastBufMs = 0, lastPrintMs = 0;
+    static bool lastBufMoving = false;
     if (est.poseReady(p)) {
-      pushDropOldest(qPose, p);
-      if (est.streamHz == 0)
+      // online: every pose (up to txHz). offline: at most 1 Hz, so the queue holds ~15 min of driving
+      if (g_linkUp || p.moving != lastBufMoving || millis() - lastBufMs >= 1000) {
+        pushDropOldest(qPose, p);
+        lastBufMs = millis();
+        lastBufMoving = p.moving;
+      }
+      bool print = millis() - lastPrintMs >= 1000 || !p.moving;
+      if (print) lastPrintMs = millis();
+      if (est.streamHz == 0 && print)
         Serial.printf("pose x=%.2f y=%.2f hdg=%.1f v=%.2f d=%.2f vib=%.3f accSd=%.3f %s %s\n", p.x, p.y,
                       p.hdg, p.spd, p.dist, p.vib, p.accSd, p.moving ? "DRIVING" : "parked",
                       SURF_NAMES[p.surf]);
@@ -267,6 +305,69 @@ static void startAP() {
   uiNotify("AP " AP_SSID, 6000);
 }
 
+// ------------------------------------------------------------------ BLE transport
+static void bleStatus() {
+  char b[240];
+  snprintf(b, sizeof(b),
+           "{\"dev\":\"%s\",\"state\":\"online\",\"link\":\"ble\",\"mtu\":%u,\"up_s\":%lu,\"queued\":%u,"
+           "\"dropped\":%lu,\"reconnects\":%lu,\"imu_err\":%lu,\"ble_err\":%lu,\"tx_hz\":%.1f}",
+           DEVICE_ID, (unsigned)(blePayloadMax() + 3), (unsigned long)(millis() / 1000),
+           (unsigned)uxQueueMessagesWaiting(qPose), (unsigned long)droppedMsgs, (unsigned long)reconnects,
+           (unsigned long)imuErrors, (unsigned long)bleNotifyErrors(), (float)g_txRate);
+  bleSendText(FRAME_STATUS, b);
+}
+
+static void bleService() {
+  static bool wasUp = false;
+  static uint32_t lastStatus = 0, rateT0 = 0, rateN = 0, lastAdvMsg = 0;
+  bool up = bleConnected();
+  if (up && !wasUp) {
+    reconnects++;
+    lastStatus = 0;
+    postInfo(String("BLE connected, mtu ") + (blePayloadMax() + 3) + ", " + uxQueueMessagesWaiting(qPose) +
+             " buffered poses");
+  } else if (!up && wasUp) {
+    Serial.println("BLE disconnected - buffering at 1 Hz");
+  } else if (!up && millis() - lastAdvMsg > 5000) {
+    lastAdvMsg = millis();
+    Serial.printf("BLE: advertising as RoadSense-%s, waiting for the Mac bridge (%u poses buffered)\n", DEVICE_ID,
+                  (unsigned)uxQueueMessagesWaiting(qPose));
+  }
+  wasUp = up;
+  g_linkUp = up;
+  if (millis() - rateT0 >= 1000) { g_txRate = rateN * 1000.0f / (millis() - rateT0); rateN = 0; rateT0 = millis(); }
+  if (!up) return;
+
+  // priority: potholes > poses > raw > info > status. Items leave a queue only once handed to the radio.
+  PotholeMsg h;
+  while (xQueuePeek(qPot, &h, 0) == pdTRUE && bleSendPothole(h)) xQueueReceive(qPot, &h, 0);
+  PoseMsg p;
+  for (int i = 0; i < 25 && xQueuePeek(qPose, &p, 0) == pdTRUE && bleSendPose(p); i++) {
+    xQueueReceive(qPose, &p, 0);
+    rateN++;
+  }
+  int per = bleRawPerFrame();
+  RawItem first;
+  while (uxQueueMessagesWaiting(qRaw) >= (UBaseType_t)per ||
+         (xQueuePeek(qRaw, &first, 0) == pdTRUE && millis() - first.tMs > 50)) {
+    if (!bleCanSend()) break;
+    RawSample buf[20];
+    uint32_t t0 = 0;
+    uint8_t n = 0;
+    RawItem r;
+    while (n < per && xQueueReceive(qRaw, &r, 0) == pdTRUE) { if (!n) t0 = r.tMs; buf[n++] = r.s; }
+    if (!n || !bleSendRaw(t0, buf, n)) break;
+  }
+  InfoLine l;
+  if (bleCanSend() && xQueueReceive(qInfo, &l, 0) == pdTRUE) bleSendText(FRAME_INFO, l.s);
+  DebugSnap d;
+  est.snapshot(d);
+  if (!lastStatus || millis() - lastStatus > (d.moving ? 5000UL : 30000UL)) {
+    bleStatus();
+    lastStatus = millis();
+  }
+}
+
 // ------------------------------------------------------------------ setup / loop
 void setup() {
   Serial.begin(115200);
@@ -282,18 +383,33 @@ void setup() {
   uiBegin();
   uiLines("RoadSense " DEVICE_ID, "booting...", "looking for MPU-6050");
 
-  int who = imuBegin(I2C_SDA, I2C_SCL, MPU_ADDR);
-  if (who < 0) who = imuBegin(I2C_SDA, I2C_SCL, MPU_ADDR == 0x68 ? 0x69 : 0x68);
+  // try both addresses at 400 kHz, then at 100 kHz (long wires / weak pull-ups)
+  const uint8_t addrs[2] = {MPU_ADDR, MPU_ADDR == 0x68 ? 0x69 : 0x68};
+  int who = -1;
+  for (uint32_t hz : {400000u, 100000u}) {
+    for (uint8_t a : addrs) {
+      if (who < 0) {
+        who = imuBegin(I2C_SDA, I2C_SCL, a, hz);
+        if (who >= 0) Serial.printf("MPU-6050 at 0x%02X, I2C %lu kHz\n", a, (unsigned long)(hz / 1000));
+      }
+    }
+  }
   while (who < 0) {
-    Serial.println("MPU-6050 NOT FOUND. Check VCC->3V3, GND, SDA->GPIO21, SCL->GPIO22.");
-    uiLines("MPU-6050 NOT FOUND", "SDA->21  SCL->22", "VCC->3V3 GND->GND", "retrying...");
-    delay(1000);
-    who = imuBegin(I2C_SDA, I2C_SCL, MPU_ADDR);
+    String found = i2cScan();
+    Serial.printf("MPU-6050 NOT FOUND on SDA=%d SCL=%d. I2C scan: %s\n", I2C_SDA, I2C_SCL, found.c_str());
+    if (found == "none")
+      Serial.println("  -> no device answers at all: check SDA/SCL not swapped, VCC->3V3, GND, loose jumpers");
+    else
+      Serial.println("  -> bus works (other parts answer) but no 0x68/0x69: MPU module power/solder/AD0 or a dead module");
+    uiLines("MPU-6050 NOT FOUND", ("scan: " + found).c_str(), "SDA->21  SCL->22", "VCC->3V3 GND->GND");
+    delay(2000);
+    for (uint8_t a : addrs)
+      if (who < 0) who = imuBegin(I2C_SDA, I2C_SCL, a, 100000);
   }
   Serial.printf("MPU-6050 found, WHO_AM_I=0x%02X\n", who);
   char whoLine[22];
   snprintf(whoLine, sizeof(whoLine), "MPU OK  WHO=0x%02X", who);
-  uiLines("RoadSense " DEVICE_ID, whoLine, "Wi-Fi: " WIFI_SSID);
+  uiLines("RoadSense " DEVICE_ID, whoLine, BLE_MODE ? "BLE: RoadSense-" DEVICE_ID : "Wi-Fi: " WIFI_SSID);
 
   est.begin();
   Serial.println("params " + est.paramsJson());
@@ -303,12 +419,19 @@ void setup() {
   qCmd = xQueueCreate(8, sizeof(CmdLine));
   qInfo = xQueueCreate(6, sizeof(InfoLine));
 
+  qRaw = xQueueCreate(400, sizeof(RawItem));
+  if (BLE_MODE) {
+    bleBegin("RoadSense-" DEVICE_ID, sendCmd);
+    Serial.println("BLE mode: advertising as RoadSense-" DEVICE_ID ". On the Mac: python tools/ble_bridge.py");
+  }
   WiFi.onEvent(onWifiEvent);
   bool forceAP = NET_MODE == 1;
 #if USE_BUTTONS
   if (NET_MODE != 0) forceAP |= digitalRead(IoTPins::BUTTON_1) == LOW;  // hold BTN1 at power-on -> AP mode
 #endif
-  if (forceAP) {
+  if (BLE_MODE) {
+    WiFi.mode(WIFI_OFF);
+  } else if (forceAP) {
     startAP();
   } else {
     WiFi.mode(WIFI_STA);
@@ -355,6 +478,10 @@ void loop() {
     }
   }
 
+  static uint32_t lastNet = 0;
+  if (millis() - lastNet > 250) { updateNet(); lastNet = millis(); }
+  if (BLE_MODE) { bleService(); delay(2); return; }
+
   static bool ntpStarted = false;
   static uint32_t lastStatus = 0, lastWifiMsg = 0;
   // auto mode: hotspot never connected within AP_FALLBACK_S -> become an access point
@@ -386,7 +513,6 @@ void loop() {
       Serial.printf("Wi-Fi: connecting to '%s'... (%u poses buffered)\n", WIFI_SSID,
                     (unsigned)uxQueueMessagesWaiting(qPose));
   }
-  static uint32_t lastNet = 0;
-  if (millis() - lastNet > 250) { updateNet(); lastNet = millis(); }
+  g_linkUp = mqtt.connected();
   delay(5);
 }

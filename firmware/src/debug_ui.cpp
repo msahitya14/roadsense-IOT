@@ -63,7 +63,10 @@ static void header(const char* page, const NetState& n, int idx) {
   oled.fillRect(0, 0, 128, 9, SSD1306_WHITE);
   oled.setTextColor(SSD1306_BLACK);
   oled.setCursor(1, 1);
-  oled.printf("%s %s %c%c M%c", DEVICE_ID, page, n.ap ? 'A' : 'W', n.wifi ? '+' : '-', n.mqtt ? '+' : '-');
+  if (n.mode == 'B')
+    oled.printf("%s %s B%c", DEVICE_ID, page, n.wifi ? '+' : '-');
+  else
+    oled.printf("%s %s %c%c M%c", DEVICE_ID, page, n.mode, n.wifi ? '+' : '-', n.mqtt ? '+' : '-');
   oled.setCursor(110, 1);
   oled.printf("%d/%d", idx + 1, NUM_PAGES);
   oled.setTextColor(SSD1306_WHITE);
@@ -142,6 +145,14 @@ static void pageCal(const DebugSnap& d) {
 }
 
 static void pageNet(const NetState& n, const DebugSnap& d) {
+  if (n.mode == 'B') {
+    line(1, "BLE %.17s", n.ssid);
+    line(2, "%s  %s", n.wifi ? "connected" : "advertising", n.wifi ? n.ip : "");
+    line(3, "tx %.1f pose/s", n.txRate);
+    line(4, "err %lu  rc %lu", (unsigned long)n.bleErr, (unsigned long)n.reconnects);
+    line(5, "q%lu drop%lu imuE%lu", (unsigned long)n.queued, (unsigned long)n.dropped, (unsigned long)n.imuErr);
+    return;
+  }
   if (n.ap) {
     line(1, "AP %.18s", n.ssid);
     line(2, "pw %.18s", AP_PASS_UI);

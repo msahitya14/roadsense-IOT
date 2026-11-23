@@ -1,3 +1,4 @@
 paho-mqtt>=2.0
+bleak>=0.22         # BLE bridge (tools/ble_bridge.py)
 numpy>=1.24
-matplotlib>=3.7   # optional, for fit_calibration.py --plot
+matplotlib>=3.7     # optional, for fit_calibration.py --plot

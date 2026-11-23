@@ -4,6 +4,9 @@
 
 // Network health, written by loop(), shown on the NET page.
 struct NetState {
+  char mode;  // 'W' hotspot, 'A' access point, 'B' BLE
+  float txRate;
+  uint32_t bleErr;
   bool wifi, mqtt, ap;
   int rssi, apClients;
   char ip[16], ssid[24], broker[16];

@@ -68,7 +68,7 @@
   <section class="card">
     <h2>Local frame (x forward at start, y left) — metres</h2>
     <canvas id="xy"></canvas>
-    <div class="row"><button id="clearPath">Clear path</button><button id="csv">Download CSV</button><small id="count"></small></div>
+    <div class="row"><button id="clearPath">Clear path</button><button id="csv">Download CSV</button><small id="count"></small> <small id="rate"></small></div>
   </section>
 
   <section class="card">
@@ -129,14 +129,22 @@ function toLocal(lat, lon) {
 function redrawMap() {
   pathLayer.clearLayers(); potLayer.clearLayers();
   originMarker.setLatLng([+$('lat0').value, +$('lon0').value]);
-  for (let i = 1; i < poses.length; i++)
-    L.polyline([toLatLon(poses[i-1].x_m, poses[i-1].y_m), toLatLon(poses[i].x_m, poses[i].y_m)],
-               { color: SURF_COL[poses[i].surf] || '#aaa', weight: 5 }).addTo(pathLayer);
+  curLine = null; curSurf = null;
+  for (let i = 0; i < poses.length; i++) extendPath(poses[i], i ? poses[i - 1] : null);
   for (const p of potholes) L.circleMarker(toLatLon(p.x_m, p.y_m), { radius: 5, color: '#ff5a5f', fillOpacity: 1 })
     .bindTooltip(`pothole z ${p.z_neg_g}/${p.z_pos_g} g`).addTo(potLayer);
   for (const c of alertClusters()) L.circle(toLatLon(c.x, c.y), { radius: 5, color: '#ff5a5f', fill: false, weight: 3 })
     .bindTooltip(`ALERT: ${c.n} potholes within 5 m`).addTo(potLayer);
   if (lastPose) carMarker.setLatLng(toLatLon(lastPose.x_m, lastPose.y_m)).addTo(map);
+}
+// one polyline per run of equal surface: cheap even at 50 poses/s for long drives
+let curLine = null, curSurf = null;
+function extendPath(p, prev) {
+  const ll = toLatLon(p.x_m, p.y_m);
+  if (!curLine || p.surf !== curSurf) {
+    curLine = L.polyline(prev ? [toLatLon(prev.x_m, prev.y_m), ll] : [ll], { color: SURF_COL[p.surf] || '#aaa', weight: 5 }).addTo(pathLayer);
+    curSurf = p.surf;
+  } else curLine.addLatLng(ll);
 }
 function alertClusters() {
   const out = [];
@@ -186,9 +194,11 @@ function drawXY() {
   for (let g = Math.floor((cx - span) / step) * step; g <= cx + span; g += step) { const [, yy] = P(g, 0); ctx.beginPath(); ctx.moveTo(0, yy); ctx.lineTo(W, yy); ctx.stroke(); ctx.fillText(g + ' m', 2, yy - 2); }
   for (let g = Math.floor((cy - span) / step) * step; g <= cy + span; g += step) { const [xx] = P(0, g); ctx.beginPath(); ctx.moveTo(xx, 0); ctx.lineTo(xx, H); ctx.stroke(); }
   ctx.lineWidth = 3;
-  for (let i = 1; i < poses.length; i++) {
-    ctx.strokeStyle = SURF_COL[poses[i].surf] || '#aaa'; ctx.beginPath();
-    ctx.moveTo(...P(poses[i-1].x_m, poses[i-1].y_m)); ctx.lineTo(...P(poses[i].x_m, poses[i].y_m)); ctx.stroke();
+  for (let i = 1; i < poses.length; ) {  // one stroke per run of equal surface
+    const surf = poses[i].surf;
+    ctx.strokeStyle = SURF_COL[surf] || '#aaa'; ctx.beginPath(); ctx.moveTo(...P(poses[i-1].x_m, poses[i-1].y_m));
+    for (; i < poses.length && poses[i].surf === surf; i++) ctx.lineTo(...P(poses[i].x_m, poses[i].y_m));
+    ctx.stroke();
   }
   ctx.fillStyle = '#4aa3ff'; ctx.beginPath(); ctx.arc(...P(0, 0), 5, 0, 7); ctx.fill();
   for (const p of potholes) { ctx.fillStyle = '#ff5a5f'; ctx.beginPath(); ctx.arc(...P(p.x_m, p.y_m), 5, 0, 7); ctx.fill(); }
@@ -200,6 +210,11 @@ function drawXY() {
   $('count').textContent = `${poses.length} poses, ${potholes.length} potholes`;
 }
 addEventListener('resize', drawXY);
+// redraw at most ~10 times per second, however fast poses arrive (BLE sends up to 100/s)
+let drawPending = false;
+function scheduleDraw() { if (!drawPending) { drawPending = true; setTimeout(() => { drawPending = false; drawXY(); }, 100); } }
+let rateN = 0;
+setInterval(() => { $('rate').textContent = rateN + ' pose/s'; rateN = 0; }, 1000);
 
 // ---------- MQTT
 function setPill(el, txt, cls) { el.textContent = txt; el.className = 'pill ' + (cls || ''); }
@@ -225,15 +240,14 @@ $('connect').onclick = () => {
   });
 };
 function onPose(m) {
-  lastPose = m; lastPoseAt = Date.now(); poses.push(m);
+  lastPose = m; lastPoseAt = Date.now(); poses.push(m); rateN++;
   $('sx').textContent = m.x_m.toFixed(2); $('sy').textContent = m.y_m.toFixed(2); $('shdg').textContent = m.hdg_deg.toFixed(1);
   $('sspd').textContent = m.spd_mps.toFixed(2); $('sdist').textContent = (m.dist_m ?? 0).toFixed(2);
   $('ssurf').textContent = `${m.surf} (${m.conf})`; $('ssurf').style.color = SURF_COL[m.surf] || '';
   $('svib').textContent = (m.vib_g ?? 0).toFixed(3); $('sacc').textContent = (m.acc_sd ?? 0).toFixed(3);
-  const ll = toLatLon(m.x_m, m.y_m);
-  if (poses.length > 1) { const q = poses[poses.length - 2]; L.polyline([toLatLon(q.x_m, q.y_m), ll], { color: SURF_COL[m.surf] || '#aaa', weight: 5 }).addTo(pathLayer); }
-  carMarker.setLatLng(ll).addTo(map);
-  drawXY();
+  extendPath(m, poses.length > 1 ? poses[poses.length - 2] : null);
+  carMarker.setLatLng(toLatLon(m.x_m, m.y_m)).addTo(map);
+  scheduleDraw();
 }
 setInterval(() => { if (lastPoseAt && Date.now() - lastPoseAt > 5000) setPill($('devPill'), 'car: no data ' + Math.round((Date.now() - lastPoseAt) / 1000) + 's', 'off'); }, 1000);
 
@@ -250,7 +264,7 @@ $('sendRaw').onclick = () => { if ($('raw').value) send($('raw').value); };
 $('raw').addEventListener('keydown', e => { if (e.key === 'Enter') $('sendRaw').click(); });
 $('clearPath').onclick = () => { poses = []; potholes = []; redrawMap(); drawXY(); };
 $('csv').onclick = () => {
-  const cols = ['ts','seq','x_m','y_m','hdg_deg','spd_mps','dist_m','surf','conf','vib_g','acc_sd','mv','label','drv_s','yaw_raw','vib_int'];
+  const cols = ['ts','t_ms','seq','x_m','y_m','hdg_deg','spd_mps','dist_m','surf','conf','vib_g','acc_sd','mv','label','drv_s','yaw_raw','vib_int'];
   const rows = [cols.concat('lat','lon').join(',')].concat(poses.map(p => cols.map(c => p[c]).concat(toLatLon(p.x_m, p.y_m).map(v => v.toFixed(7))).join(',')));
   const a = document.createElement('a'); a.href = URL.createObjectURL(new Blob([rows.join('\n')], { type: 'text/csv' }));
   a.download = 'roadsense_' + Date.now() + '.csv'; a.click();

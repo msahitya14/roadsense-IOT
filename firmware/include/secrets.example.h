@@ -1,12 +1,13 @@
 #pragma once
-// Copy to secrets.h and fill in (or run broker/setup.sh, which writes it for a local broker).
+// Copy to secrets.h and fill in (or run broker/setup.sh). In BLE mode (NET_MODE 3) the values are unused,
+// but the file must exist.
 // secrets.h is git-ignored: never commit real passwords.
 
 #define WIFI_SSID   "your-hotspot-name"      // 2.4 GHz only (ESP32 has no 5 GHz radio)
 #define WIFI_PASS   "your-hotspot-password"
 
 // ---------------- Option 1: local Mosquitto on the laptop (broker/run.sh) ----------------
-#define MQTT_HOST   "192.168.1.50"           // laptop IP on the same Wi-Fi (run.sh prints/updates it)
+#define MQTT_HOST   "192.168.1.50"           // (Wi-Fi modes only) laptop IP on the same Wi-Fi (run.sh prints/updates it)
 #define MQTT_PORT   1883
 #define MQTT_TLS    0
 #define MQTT_USER   "rs01"

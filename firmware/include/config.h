@@ -22,10 +22,9 @@
 #define OLED_FPS       5
 
 #define SAMPLE_HZ      200               // IMU sample + estimator rate
-#define POSE_PERIOD_S  1                 // pose/surface message every N seconds
+// Pose rate is a runtime parameter: `set txHz 50` while driving, `set parkS 5` while parked.
 
-// Offline buffer: 600 pose messages = 10 min at 1 Hz
-#define POSE_QUEUE_LEN     600
+#define POSE_QUEUE_LEN     900   // offline: poses are buffered at max 1 Hz
 #define POTHOLE_QUEUE_LEN  50
 
 // Networking
@@ -34,7 +33,8 @@
 //   2 = auto: try the hotspot, fall back to AP mode if it never connects within AP_FALLBACK_S
 // In modes 1/2, holding BTN1 while powering on also forces AP mode.
 // AP password defaults to "roadsense24"; override with #define AP_PASS in secrets.h.
-#define NET_MODE       0   // 0 for a cloud broker / hotspot; 1 for the offline AP demo
+//   3 = BLE: no Wi-Fi; the Mac runs tools/ble_bridge.py, which forwards everything to its local broker
+#define NET_MODE       3
 #define AP_FALLBACK_S  20
 
 // Accept commands on rs/T24/cmd/<dev> (handy for calibration from the dashboard).

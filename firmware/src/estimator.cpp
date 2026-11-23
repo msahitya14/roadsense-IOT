@@ -14,7 +14,7 @@ static uint32_t nowTs() {
 static float clampf(float v, float lo, float hi) { return v < lo ? lo : (v > hi ? hi : v); }
 
 void Estimator::setDefaults() {
-  p_ = {0.80f, 0.15f, 0, 1.0f, 0.035f, -0.60f, 0.90f, 1.80f, 0.08f, 0.20f, 0.0f};
+  p_ = {0.80f, 0.15f, 0, 1.0f, 0.035f, -0.60f, 0.90f, 1.80f, 0.08f, 0.20f, 0.0f, 50, 5.0f};
 }
 
 void Estimator::begin() {
@@ -31,6 +31,8 @@ void Estimator::begin() {
   p_.surfT1 = prefs.getFloat("surfT1", p_.surfT1);
   p_.surfT2 = prefs.getFloat("surfT2", p_.surfT2);
   p_.kVib = prefs.getFloat("kVib", p_.kVib);
+  p_.txHz = prefs.getInt("txHz", p_.txHz);
+  p_.parkS = prefs.getFloat("parkS", p_.parkS);
 }
 
 void Estimator::save() {
@@ -45,6 +47,8 @@ void Estimator::save() {
   prefs.putFloat("surfT1", p_.surfT1);
   prefs.putFloat("surfT2", p_.surfT2);
   prefs.putFloat("kVib", p_.kVib);
+  prefs.putInt("txHz", p_.txHz);
+  prefs.putFloat("parkS", p_.parkS);
 }
 
 bool Estimator::calibrateStill(uint32_t ms, String& msg) {
@@ -95,6 +99,7 @@ uint8_t Estimator::classify(float rms, float& conf) const {
 
 void Estimator::flagPothole() {
   pot_.ts = nowTs();
+  pot_.tMs = millis();
   pot_.seq = ++seq_;
   pot_.x = x_; pot_.y = y_;
   pot_.zneg = zmin_; pot_.zpos = zmax_; pot_.pitch = pmax_;
@@ -187,10 +192,14 @@ void Estimator::update(const ImuSample& s, float dt) {
   if (++azPeakN_ >= SAMPLE_HZ) { azPeakPrev_ = azPeak_; azPeak_ = 0; azPeakN_ = 0; }
   if (++snapCnt_ >= SAMPLE_HZ / 10) { snapCnt_ = 0; fillSnap(s, yaw); }
 
-  // ---- 1 Hz pose message
-  if (++poseCnt_ >= SAMPLE_HZ * POSE_PERIOD_S) {
+  // ---- pose message: txHz while driving, every parkS while parked, and at once on start/stop
+  int every = moving_ ? max(1, SAMPLE_HZ / constrain(p_.txHz, 1, SAMPLE_HZ))
+                      : max(1, (int)(SAMPLE_HZ * fmaxf(p_.parkS, 0.2f)));
+  if (++poseCnt_ >= every || moving_ != lastSentMoving_) {
     poseCnt_ = 0;
+    lastSentMoving_ = moving_;
     pose_.ts = nowTs();
+    pose_.tMs = millis();
     pose_.seq = ++seq_;
     pose_.x = x_; pose_.y = y_;
     pose_.hdg = theta_ < 0 ? theta_ + 360 : theta_;
@@ -240,13 +249,14 @@ bool Estimator::potholeReady(PotholeMsg& out) {
 }
 
 String Estimator::paramsJson() const {
-  char b[360];
+  char b[420];
   snprintf(b, sizeof(b),
            "{\"v0\":%.4f,\"vibRef\":%.4f,\"spdMode\":%d,\"gyroScale\":%.4f,\"movTh\":%.4f,"
            "\"potNeg\":%.3f,\"potPos\":%.3f,\"potBig\":%.3f,\"surfT1\":%.4f,\"surfT2\":%.4f,\"kVib\":%.4f,"
+           "\"txHz\":%d,\"parkS\":%.1f,"
            "\"bias\":[%.3f,%.3f,%.3f],\"label\":\"%s\"}",
            p_.v0, p_.vibRef, p_.spdMode, p_.gyroScale, p_.movTh, p_.potNeg, p_.potPos, p_.potBig,
-           p_.surfT1, p_.surfT2, p_.kVib, bx_, by_, bz_, label_);
+           p_.surfT1, p_.surfT2, p_.kVib, p_.txHz, p_.parkS, bx_, by_, bz_, label_);
   return String(b);
 }
 
@@ -258,9 +268,10 @@ static const char* HELP =
     "  anchor <x> <y> [hdg] re-anchor pose at a known waypoint (m, m, deg)\n"
     "  dcal start | dcal end <meters>   distance/speed calibration run\n"
     "  tcal start | tcal end <degrees>  gyro/turn calibration\n"
-    "  set <key> <value>    keys: v0 vibRef spdMode kVib gyroScale movTh potNeg potPos potBig surfT1 surfT2\n"
+    "  set <key> <value>    keys: v0 vibRef spdMode kVib gyroScale movTh potNeg potPos potBig surfT1 surfT2 txHz parkS\n"
     "  label <name>         tag following pose messages (asphalt/gravel/grass...) for data collection\n"
     "  stream <hz>          raw IMU CSV on serial (0 = off, max 100)\n"
+    "  raw on|off           200 Hz raw IMU over BLE (saved by tools/ble_bridge.py)\n"
     "  time <unix s>        set the clock (dashboard does this automatically)\n"
     "  defaults             restore default parameters";
 
@@ -355,6 +366,8 @@ String Estimator::command(const String& lineIn) {
     else if (k == "surfT1") p_.surfT1 = v1;
     else if (k == "surfT2") p_.surfT2 = v1;
     else if (k == "kVib") p_.kVib = v1;
+    else if (k == "txHz") p_.txHz = constrain((int)v1, 1, 100);
+    else if (k == "parkS") p_.parkS = fmaxf(v1, 0.2f);
     else return "unknown key " + k;
     save();
     return "set " + k + " = " + String(v1, 4) + " (saved)";
@@ -368,6 +381,12 @@ String Estimator::command(const String& lineIn) {
     sscanf(line.c_str(), "%*s %d", &hz);
     streamHz = constrain(hz, 0, 100);
     return "stream " + String(streamHz) + " Hz (format: R,ms,ax,ay,az,gx,gy,gz,azl)";
+  }
+  if (c == "raw") {  // full-rate raw IMU stream over BLE
+    sscanf(line.c_str(), "%*s %23s", arg);
+    String a(arg);
+    rawLink = (a == "on" || a == "1");
+    return String("raw BLE stream ") + (rawLink ? "ON (200 Hz)" : "off");
   }
   if (c == "time") {  // clock sync from the dashboard (no NTP in AP mode)
     unsigned long t = 0;

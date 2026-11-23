@@ -56,7 +56,12 @@ def run_series(poses):
     T = np.array([p["drv_s"] for p in poses], float)
     V = np.array([p["vib_int"] for p in poses], float)
     P = np.array([p["yaw_raw"] for p in poses], float)
-    t = np.arange(1, len(poses) + 1, dtype=float)  # poses arrive at 1 Hz
+    if all("t_ms" in p for p in poses) and len(poses) > 1:  # car clock: works at any pose rate
+        tm = np.array([p["t_ms"] for p in poses], float) / 1000.0
+        step = float(np.median(np.diff(tm))) or 1.0
+        t = tm - tm[0] + step
+    else:  # older firmware: 1 Hz poses
+        t = np.arange(1, len(poses) + 1, dtype=float)
     warn = None
     if T[0] > 1.5:  # label was set long after reset: measure from the first labelled pose instead
         warn = f"first pose already has drv_s={T[0]:.1f}s (reset before labelling?) -> using it as start"
@@ -108,7 +113,7 @@ def simulate(params, model, S):
     dd = q["v0"] * dT + (q.get("kv", 0.0) * dV if model["speed"] == "vib" else 0.0)
     dd = np.maximum(dd, 0.0)
     th = q["s"] * S["P"] - (q.get("beta", 0.0) * S["t"] if model["bias"] else 0.0)
-    th_mid = np.radians(0.5 * (th[1:] + th[:-1]))  # midpoint rule over each 1-s interval
+    th_mid = np.radians(0.5 * (th[1:] + th[:-1]))  # midpoint rule over each pose interval
     return dd @ np.cos(th_mid), dd @ np.sin(th_mid), th[-1], dd.sum()
 
 

@@ -4,15 +4,15 @@
 
 IoT course project, Project & Lab Group 24.
 
-The car estimates where it is by dead reckoning, using only a 6-axis IMU. There is no wheel encoder and no GPS on the car. It classifies the road surface from vibration, flags potholes from vertical acceleration spikes, and sends compact JSON over MQTT to a dashboard. The dashboard draws the path on a real map.
+The car estimates where it is by dead reckoning, using only a 6-axis IMU. There is no wheel encoder and no GPS on the car. It classifies the road surface from vibration and flags potholes from vertical acceleration spikes. **By default it streams to a Mac over BLE**: up to 100 poses per second while driving, one every few seconds when parked. A bridge on the Mac republishes the data to a local MQTT broker, which feeds the dashboard (path on a real map), the logger and the calibration tools. Wi-Fi/MQTT (local or cloud TLS) is still available as an alternative.
 
 ```
- MPU-6050 ──I²C──▶ ESP32 (edge processing, 200 Hz) ──Wi-Fi/MQTT──▶ broker ──▶ dashboard (map + XY plot)
- (accel+gyro)       • driving detector + speed model                (local      ──▶ logger (JSONL) ──▶ calibration fit
-                    • gyro heading, bias tracking                    Mosquitto
-                    • surface class, pothole events                  or cloud,
-                    • 10-min offline buffer                          TLS)
-                    • OLED debug pages, LEDs, buttons
+ MPU-6050 ─I²C─▶ ESP32 (edge processing, 200 Hz) ─BLE─▶ Mac: ble_bridge.py ─▶ local Mosquitto ─▶ dashboard (map + XY)
+ (accel+gyro)     • driving detector + speed model     (binary frames,       (localhost)       ─▶ logger (JSONL)
+                  • gyro heading, bias tracking          50 Hz driving,                         ─▶ calibration fit
+                  • surface class, pothole events        0.2 Hz parked,
+                  • offline buffer (1 Hz, ~15 min)       raw IMU 200 Hz opt.)
+                  • OLED debug pages, LEDs, buttons     (alternative: Wi-Fi ─MQTT─▶ broker)
 ```
 
 | Measurement | How it is estimated with an IMU only |
@@ -35,6 +35,7 @@ The equations, the models we compare, and the calibration procedure are in **[do
 ├── broker/                local Mosquitto: config, ACL, setup.sh (users), run.sh (start on the LAN)
 ├── dashboard/index.html   browser dashboard: Leaflet map, local XY plot, calibration buttons (works offline)
 ├── tools/
+│   ├── ble_bridge.py          BLE ⇄ MQTT gateway on the Mac (default transport), raw IMU → logs/raw-*.csv
 │   ├── logger.py              record every MQTT message to logs/*.jsonl
 │   ├── simulate_car.py        fake car for testing the broker and dashboard without hardware
 │   ├── fit_calibration.py     fit speed and gyro models from start → end runs (LOO cross-validation, plot)
@@ -69,9 +70,19 @@ Mount the IMU **rigidly** (screws, zip ties or hot glue, not foam). Any orientat
   ```
 * For a local broker: Mosquitto (`brew install mosquitto` on macOS)
 
-### 2. Pick a broker
+### 2. Pick a transport
 
-**A. Cloud broker over TLS (recommended when the laptop and car can't share a network).** Use the HiveMQ Cloud free tier, or any MQTT broker with TLS.
+**BLE to the Mac (default, `NET_MODE 3`).** You don't need a Wi-Fi network or an online server. Range is about 10–30 m. If the car drives out of range, it buffers poses at 1 Hz and sends them when it reconnects.
+```bash
+cd broker && ./setup.sh   # once: broker users (rs01, dashboard)
+./run.sh                  # local Mosquitto + dashboard on http://localhost:8000
+# second terminal:
+.venv/bin/python tools/ble_bridge.py          # finds "RoadSense-rs01", forwards everything to the broker
+.venv/bin/python tools/ble_bridge.py --raw    # ... plus the 200 Hz raw IMU stream -> logs/raw-*.csv
+```
+The first time, macOS asks to allow Bluetooth for Terminal (System Settings → Privacy & Security → Bluetooth). With BLE, `secrets.h` only needs to exist; the Wi-Fi values are unused. To run without any broker, use `ble_bridge.py --no-mqtt`, which writes `logs/ble-*.jsonl` that `fit_calibration.py` reads directly.
+
+**A. Wi-Fi to a cloud broker over TLS (recommended when the laptop and car can't share a network).** Use the HiveMQ Cloud free tier, or any MQTT broker with TLS.
 1. Create a cluster and two users:
    * `rs01` for the car, allowed to publish `rs/T24/#` and subscribe to `rs/T24/cmd/rs01`,
    * `dashboard`, allowed to subscribe to `rs/T24/#` and publish to `rs/T24/cmd/#`.
@@ -79,7 +90,7 @@ Mount the IMU **rigidly** (screws, zip ties or hot glue, not foam). Any orientat
 3. In the dashboard, connect to `wss://<cluster-host>:8884/mqtt` as `dashboard`.
 4. Run the tools with `--host <cluster-host> --tls --user dashboard --password …`.
 
-**B. Local Mosquitto on the laptop.** The laptop and the car must be on the same 2.4 GHz network.
+**B. Wi-Fi to a local Mosquitto on the laptop.** The laptop and the car must be on the same 2.4 GHz network.
 ```bash
 cd broker
 ./setup.sh      # once: creates users rs01/dashboard and firmware/include/secrets.h
@@ -90,12 +101,12 @@ cd broker
 
 ### 3. Flash the car
 
-Set `WIFI_SSID` / `WIFI_PASS` in `secrets.h` (the network must be **2.4 GHz**), then:
+Create `secrets.h` (copy `secrets.example.h`). For Wi-Fi modes, set `WIFI_SSID` / `WIFI_PASS`; the network must be **2.4 GHz**. Then:
 ```bash
 cd firmware
 pio run -t upload && pio device monitor
 ```
-Keep the car still for the first 2 seconds (gyro calibration). The OLED shows `W+ M+` once Wi-Fi and MQTT are up.
+Keep the car still for the first 2 seconds (gyro calibration). The OLED header shows `B+` once the BLE bridge is connected (`W+ M+` in Wi-Fi mode). The NET page shows the live transmit rate.
 
 ### 4. Dashboard and logging
 
@@ -150,16 +161,17 @@ The base topic is `rs/T24`. Every message is JSON. Data messages use QoS 1.
 
 | Topic | When | Payload |
 |---|---|---|
-| `rs/T24/pose` | 1 Hz | `dev, ts, seq, x_m, y_m, hdg_deg, spd_mps, surf, conf, dist_m, vib_g, acc_sd, mv, label, drv_s, yaw_raw, vib_int` |
+| `rs/T24/pose` | `txHz` while driving (default 50), every `parkS` s parked (default 5), and at once on start/stop | `dev, ts, t_ms, seq, x_m, y_m, hdg_deg, spd_mps, surf, conf, dist_m, vib_g, acc_sd, mv, label, drv_s, yaw_raw, vib_int` |
 | `rs/T24/pothole` | on event | `dev, ts, seq, x_m, y_m, z_neg_g, z_pos_g, pitch_dps` |
-| `rs/T24/status` | retained, every 10 s; Last Will `offline` | `dev, state, ip, rssi, up_s, queued, dropped, reconnects, imu_err` |
+| `rs/T24/status` | retained; every 5 s driving / 30 s parked (BLE), 10 s (Wi-Fi); `offline` on disconnect | `dev, state, link, mtu, up_s, queued, dropped, reconnects, imu_err, ble_err, tx_hz` |
 | `rs/T24/info` | command replies, calibration results | text |
 | `rs/T24/cmd/rs01` | dashboard → car (development only) | text command, e.g. `reset` |
 
 * `hdg_deg` is counter-clockwise from the start direction.
 * `x` points along the start direction and `y` to the left.
 * `drv_s`, `yaw_raw` and `vib_int` are the raw integrals the calibration fit uses.
-* `ts` is Unix time when NTP (or the dashboard's `time` sync) is available, otherwise seconds since boot.
+* `ts` is Unix time when NTP (or the `time` sync that the bridge and dashboard send) is available, otherwise seconds since boot. `t_ms` is the car's millisecond clock; use it for timing at high pose rates.
+* The BLE binary frame format is documented in [firmware/src/ble_link.cpp](firmware/src/ble_link.cpp) and decoded in [tools/ble_bridge.py](tools/ble_bridge.py).
 
 ## Security (STRIDE summary)
 

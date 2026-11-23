@@ -15,10 +15,12 @@ struct Params {
   float surfT1;     // g RMS below -> "smooth"
   float surfT2;     // g RMS below -> "medium", above -> "rough"
   float kVib;       // m/s per g  (spdMode 2: v = v0 + kVib * vib)
+  int   txHz;       // pose messages per second while driving (1..100)
+  float parkS;      // seconds between pose messages while parked
 };
 
 struct PoseMsg {
-  uint32_t ts, seq;
+  uint32_t ts, seq, tMs;  // tMs = millis() on the car
   float x, y, hdg, spd, dist, vib, accSd, conf;
   float drvS, yawRaw, vibInt;  // raw, parameter-free integrals since reset (for offline calibration fits)
   uint8_t surf, moving;
@@ -26,7 +28,7 @@ struct PoseMsg {
 };
 
 struct PotholeMsg {
-  uint32_t ts, seq;
+  uint32_t ts, seq, tMs;
   float x, y, zneg, zpos, pitch;
 };
 
@@ -59,7 +61,8 @@ class Estimator {
   String command(const String& line);
   String paramsJson() const;
   void snapshot(DebugSnap& out);  // thread-safe copy for the display task
-  int streamHz = 0;  // raw serial stream rate (0 = off)
+  int streamHz = 0;    // raw serial stream rate (0 = off)
+  bool rawLink = false;  // 200 Hz raw IMU over BLE while connected (`raw on`)
 
  private:
   void fillSnap(const ImuSample& s, float yaw);
@@ -95,6 +98,7 @@ class Estimator {
   int mwN_ = 0; float mwSum_ = 0, mwSq_ = 0; int quietWins_ = 0; float accSd_ = 0;
   int swN_ = 0; float swSum_ = 0, swSq_ = 0; float vibRms_ = 0;
   int poseCnt_ = 0;
+  bool lastSentMoving_ = false;
 
   // pothole detector
   bool armed_ = false; float armT_ = 0, refractory_ = 0;
